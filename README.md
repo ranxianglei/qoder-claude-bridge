@@ -40,9 +40,15 @@ claude --version
 
 安装 Qoder CLI：
 ```bash
-npm install -g @anthropic-ai/qoder-cli
-# 或从源码安装
+curl -fsSL https://qoder.com/install | bash
 ```
+
+登录 Qoder 账号（必须完成，否则桥接无法工作）：
+```bash
+qoder login
+```
+
+> ⚠️ **重要**: 使用本桥接前，必须先完成 Qoder 账号登录。Qoder CLI 会将请求转发到 Qoder 后端，未登录时所有 AI 调用都会失败。
 
 ### 2. 构建桥接包
 
