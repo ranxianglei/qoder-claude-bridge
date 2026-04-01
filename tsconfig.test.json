@@ -1,0 +1,11 @@
+// tsconfig for tests — relaxes some constraints and adds vitest types
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noUncheckedIndexedAccess": false,
+    "exactOptionalPropertyTypes": false,
+    "types": ["vitest/globals"]
+  },
+  "include": ["src/**/*", "tests/**/*"]
+}
