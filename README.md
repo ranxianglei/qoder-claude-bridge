@@ -16,7 +16,17 @@
 
 > ⚠️ **注意**: Claude Code 升级后需要重新运行安装脚本。新版本可能需要更新补丁模式。
 
+## 一键安装
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ranxianglei/qoder-claude-bridge/master/install.sh | bash
+```
+
+脚本会自动完成：clone 仓库 → 安装依赖 → 编译 → 打 patch。
+
 ## 快速开始
+
+> 如果你想手动安装或参与开发，请按以下步骤操作。
 
 ### 1. 前置条件
 
@@ -100,11 +110,15 @@ claude -p "你的提示词"
 ## 安装脚本命令
 
 ```bash
-# 安装补丁
-./install.sh
+# 一键安装（推荐，无需 clone 仓库）
+curl -fsSL https://raw.githubusercontent.com/ranxianglei/qoder-claude-bridge/master/install.sh | bash
 
 # 强制安装（跳过版本和模式检测，不推荐）
-./install.sh --force
+curl -fsSL https://raw.githubusercontent.com/ranxianglei/qoder-claude-bridge/master/install.sh | bash -s -- --force
+
+# 以下命令需要先下载脚本：
+curl -fsSL https://raw.githubusercontent.com/ranxianglei/qoder-claude-bridge/master/install.sh -o install.sh
+chmod +x install.sh
 
 # 查看状态
 ./install.sh --status
@@ -114,9 +128,6 @@ claude -p "你的提示词"
 
 # 卸载（恢复原文件）
 ./install.sh --uninstall
-
-# 帮助
-./install.sh --help
 ```
 
 ## 文件说明
