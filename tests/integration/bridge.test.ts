@@ -44,7 +44,7 @@ function makeMockClient(mockEnv: Record<string, string> = {}): AcpClient {
 async function collect(
   client: AcpClient,
   sessionId: string,
-): Promise<{ assistant: AssistantAPIMessage[]; errors: unknown[] }> {
+): Promise<{ assistant: AssistantAPIMessage[]; streamEvents: Array<{ event: { type: string; [key: string]: unknown } }>; errors: unknown[] }> {
   const entry: SessionEntry = {
     client,
     acpSessionId: sessionId,
@@ -54,13 +54,15 @@ async function collect(
   }
   const content = [{ type: 'text' as const, text: 'test prompt' }]
   const assistant: AssistantAPIMessage[] = []
+  const streamEvents: Array<{ event: { type: string; [key: string]: unknown } }> = []
   const errors: unknown[] = []
 
   for await (const msg of acpToSdkMessages(entry, content)) {
     if (msg.type === 'assistant') assistant.push(msg as AssistantAPIMessage)
+    if (msg.type === 'stream_event') streamEvents.push(msg as { event: { type: string; [key: string]: unknown } })
     if (msg.type === 'system') errors.push(msg)
   }
-  return { assistant, errors }
+  return { assistant, streamEvents, errors }
 }
 
 // ---------------------------------------------------------------------------
@@ -216,22 +218,19 @@ describe('AcpToSdkMessageBridge', () => {
     await client.start()
     const sessionId = await client.newSession('/tmp/test')
 
-    const { assistant, errors } = await collect(client, sessionId)
+    const { assistant, streamEvents, errors } = await collect(client, sessionId)
     expect(errors).toHaveLength(0)
-    expect(assistant.length).toBeGreaterThanOrEqual(1)
+    expect(assistant).toHaveLength(1)
+    expect(streamEvents.some((e) => e.event.type === 'content_block_delta')).toBe(true)
 
-    const onlyText = assistant.at(-1)?.message.content.find((c) => c.type === 'text') as
+    const onlyText = assistant[0]?.message.content.find((c) => c.type === 'text') as
       | { type: 'text'; text: string }
       | undefined
     expect(onlyText?.text).toBe(exactText)
 
-    const last = assistant.at(-1)
+    const last = assistant[0]
     expect(last?.message.stop_reason).toBe('end_turn')
     expect(last?.message.model).toBe('qoder')
-    if (assistant.length > 1) {
-      expect(assistant[0]?.message.id).toBe(last?.message.id)
-      expect(assistant[0]?.message.stop_reason).toBeNull()
-    }
     client.destroy()
   })
 
@@ -241,12 +240,12 @@ describe('AcpToSdkMessageBridge', () => {
     const sessionId = await client.newSession('/tmp/test')
 
     const { assistant } = await collect(client, sessionId)
-    expect(assistant.length).toBeGreaterThanOrEqual(1)
+    expect(assistant).toHaveLength(1)
 
     const hasToolUse = assistant.some((m) => m.message.content.some((c) => c.type === 'tool_use'))
     expect(hasToolUse).toBe(false)
 
-    const allText = (assistant.at(-1)?.message.content ?? [])
+    const allText = (assistant[0]?.message.content ?? [])
       .filter((c) => c.type === 'text')
       .map((c) => (c as { type: 'text'; text: string }).text)
       .join('')
@@ -264,9 +263,9 @@ describe('AcpToSdkMessageBridge', () => {
 
     const { assistant, errors } = await collect(client, sessionId)
     expect(errors).toHaveLength(0)
-    expect(assistant.length).toBeGreaterThanOrEqual(1)
+    expect(assistant).toHaveLength(1)
 
-    const allText = (assistant.at(-1)?.message.content ?? [])
+    const allText = (assistant[0]?.message.content ?? [])
       .filter((c) => c.type === 'text')
       .map((c) => (c as { type: 'text'; text: string }).text)
       .join('')
@@ -284,9 +283,9 @@ describe('AcpToSdkMessageBridge', () => {
 
     const { assistant, errors } = await collect(client, sessionId)
     expect(errors).toHaveLength(0)
-    expect(assistant.length).toBeGreaterThanOrEqual(1)
+    expect(assistant).toHaveLength(1)
 
-    const allText = (assistant.at(-1)?.message.content ?? [])
+    const allText = (assistant[0]?.message.content ?? [])
       .filter((c) => c.type === 'text')
       .map((c) => (c as { type: 'text'; text: string }).text)
       .join('')
@@ -310,44 +309,45 @@ describe('AcpToSdkMessageBridge', () => {
 
     const { assistant, errors } = await collect(client, sessionId)
     expect(errors).toHaveLength(0)
-    expect(assistant.length).toBeGreaterThanOrEqual(1)
+    expect(assistant).toHaveLength(1)
 
-    const text = (assistant.at(-1)?.message.content ?? [])
+    const text = (assistant[0]?.message.content ?? [])
       .filter((c) => c.type === 'text')
       .map((c) => (c as { type: 'text'; text: string }).text)
       .join('')
     expect(text).toBe('from-stop-reason')
 
-    expect(assistant.at(-1)?.message.stop_reason).toBe('end_turn')
+    expect(assistant[0]?.message.stop_reason).toBe('end_turn')
     client.destroy()
   })
 
-  it('streams cumulative partial assistant snapshots with a stable message id', async () => {
+  it('streams text through stream_event deltas without emitting duplicate assistant snapshots', async () => {
     const client = makeMockClient({ MOCK_RESPONSE_TEXT: 'Streaming works across chunks.' })
     await client.start()
     const sessionId = await client.newSession('/tmp/test')
 
-    const { assistant, errors } = await collect(client, sessionId)
+    const { assistant, streamEvents, errors } = await collect(client, sessionId)
     expect(errors).toHaveLength(0)
-    expect(assistant.length).toBeGreaterThan(1)
+    expect(assistant).toHaveLength(1)
 
-    const ids = new Set(assistant.map((m) => m.message.id))
-    expect(ids.size).toBe(1)
+    const eventTypes = streamEvents.map((e) => e.event.type)
+    expect(eventTypes).toContain('message_start')
+    expect(eventTypes).toContain('content_block_start')
+    expect(eventTypes).toContain('content_block_delta')
+    expect(eventTypes).toContain('message_delta')
+    expect(eventTypes).toContain('message_stop')
 
-    const texts = assistant.map((m) => {
-      const textBlock = m.message.content.find((c) => c.type === 'text') as
-        | { type: 'text'; text: string }
-        | undefined
-      return textBlock?.text ?? ''
-    })
+    const deltaTexts = streamEvents
+      .filter((e) => e.event.type === 'content_block_delta')
+      .map((e) => (e.event.delta as { type: string; text?: string }).text ?? '')
+      .join('')
 
-    for (let i = 1; i < texts.length; i += 1) {
-      expect(texts[i]?.startsWith(texts[i - 1] ?? '')).toBe(true)
-    }
-
-    expect(assistant[0]?.message.stop_reason).toBeNull()
-    expect(assistant.at(-1)?.message.stop_reason).toBe('end_turn')
-    expect(texts.at(-1)).toBe('Streaming works across chunks.')
+    expect(deltaTexts).toBe('Streaming works across chunks.')
+    expect(assistant[0]?.message.stop_reason).toBe('end_turn')
+    const finalText = assistant[0]?.message.content.find((c) => c.type === 'text') as
+      | { type: 'text'; text: string }
+      | undefined
+    expect(finalText?.text).toBe('Streaming works across chunks.')
     client.destroy()
   })
 

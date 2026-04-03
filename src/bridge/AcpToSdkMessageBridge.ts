@@ -4,6 +4,7 @@ import type { SessionEntry } from '../session/SessionManager.js'
 import type {
   AssistantAPIMessage,
   CallModelYield,
+  StreamEvent,
   SystemAPIErrorMessage,
 } from '../types/claudeCode.js'
 
@@ -79,11 +80,9 @@ export async function* acpToSdkMessages(
 
   let assistantTextBuffer = ''
   let statusBuffer = ''
-  let lastPartialText = ''
-  let lastPartialAt = 0
   const messageId = `msg_qoder_${randomUUID().replace(/-/g, '').slice(0, 24)}`
-  const PARTIAL_MIN_INTERVAL_MS = 120
-  const PARTIAL_MIN_CHARS = 24
+  let emittedMessageStart = false
+  let emittedTextBlockStart = false
 
   const appendStatus = (line: string): void => {
     statusBuffer += `[Qoder] ${line}\n`
@@ -96,26 +95,41 @@ export async function* acpToSdkMessages(
     return statusBuffer || assistantTextBuffer
   }
 
-  const shouldEmitPartial = (): boolean => {
-    if (!assistantTextBuffer) return false
-    if (assistantTextBuffer === lastPartialText) return false
-
-    const now = Date.now()
-    const deltaChars = assistantTextBuffer.length - lastPartialText.length
-    const newestChar = assistantTextBuffer.at(-1) ?? ''
-    const boundaryChar = newestChar === '\n' || /[.!?。！？]/.test(newestChar)
-    const intervalElapsed = now - lastPartialAt >= PARTIAL_MIN_INTERVAL_MS
-
-    return boundaryChar || deltaChars >= PARTIAL_MIN_CHARS || intervalElapsed
+  function* yieldStreamPrelude(): Generator<StreamEvent> {
+    if (!emittedMessageStart) {
+      emittedMessageStart = true
+      yield buildStreamEvent({
+        type: 'message_start',
+        message: {
+          id: messageId,
+          type: 'message',
+          role: 'assistant',
+          content: [],
+          model: 'qoder',
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      })
+    }
+    if (!emittedTextBlockStart) {
+      emittedTextBlockStart = true
+      yield buildStreamEvent({
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: '' },
+      })
+    }
   }
 
-  function* yieldPartial(): Generator<AssistantAPIMessage> {
-    if (!shouldEmitPartial()) {
-      return
-    }
-    lastPartialText = assistantTextBuffer
-    lastPartialAt = Date.now()
-    yield buildAssistantTextMessage(messageId, assistantTextBuffer, true)
+  function* yieldTextDelta(deltaText: string): Generator<StreamEvent> {
+    if (!deltaText) return
+    yield* yieldStreamPrelude()
+    yield buildStreamEvent({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text: deltaText },
+    })
   }
 
   // yieldFinal: yield the last assistant message with stop_reason='end_turn'.
@@ -124,11 +138,23 @@ export async function* acpToSdkMessages(
   // If we have buffered text, flush it as the terminal message.
   // If the buffer is empty (e.g. the turn only had tool calls), synthesise a
   // minimal text message so the content array is non-empty.
-  function* yieldFinal(): Generator<AssistantAPIMessage> {
+  function* yieldFinal(): Generator<CallModelYield> {
     const text = buildFinalText()
     assistantTextBuffer = ''
     statusBuffer = ''
-    lastPartialText = ''
+    if (emittedTextBlockStart) {
+      yield buildStreamEvent({ type: 'content_block_stop', index: 0 })
+    }
+    if (emittedMessageStart) {
+      yield buildStreamEvent({
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn', stop_sequence: null },
+        usage: { input_tokens: 0, output_tokens: 0, output_tokens_details: null },
+      })
+      yield buildStreamEvent({ type: 'message_stop' })
+    }
+    emittedMessageStart = false
+    emittedTextBlockStart = false
     if (text) {
       yield buildAssistantTextMessage(messageId, text, false /*terminal*/)
     } else {
@@ -150,8 +176,8 @@ export async function* acpToSdkMessages(
       }
 
       if (update.sessionUpdate === 'agent_message_chunk') {
+        yield* yieldTextDelta(update.content.text)
         assistantTextBuffer += update.content.text
-        yield* yieldPartial()
         continue
       }
 
@@ -223,11 +249,7 @@ export async function* acpToSdkMessages(
 // Message builders
 // ---------------------------------------------------------------------------
 
-function buildAssistantTextMessage(
-  id: string,
-  text: string,
-  partial = false,
-): AssistantAPIMessage {
+function buildAssistantTextMessage(id: string, text: string, partial = false): AssistantAPIMessage {
   console.error('[qoder-bridge] buildAssistantTextMessage, text="' + text.slice(0, 50) + '...", partial=' + partial)
   return {
     type: 'assistant',
@@ -241,6 +263,13 @@ function buildAssistantTextMessage(
       stop_sequence: null,
       usage: { input_tokens: 0, output_tokens: 0 },
     },
+  }
+}
+
+function buildStreamEvent(event: StreamEvent['event']): StreamEvent {
+  return {
+    type: 'stream_event',
+    event,
   }
 }
 
