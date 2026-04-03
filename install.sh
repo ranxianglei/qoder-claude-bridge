@@ -24,8 +24,7 @@ REPO="ranxianglei/qoder-claude-bridge"
 BRANCH="master"
 REPO_URL="https://github.com/${REPO}.git"
 
-# Supported Claude Code versions
-SUPPORTED_VERSIONS=("2.1.89")
+KNOWN_TESTED_VERSIONS=("2.1.89")
 
 FORCE_MODE=false
 BACKUP_DIR="$HOME/.qoder-bridge-backups"
@@ -81,46 +80,12 @@ get_claude_version() {
     echo "$version"
 }
 
-is_version_supported() {
+is_version_known_tested() {
     local version="$1"
-    for v in "${SUPPORTED_VERSIONS[@]}"; do
+    for v in "${KNOWN_TESTED_VERSIONS[@]}"; do
         [ "$version" == "$v" ] && return 0
     done
     return 1
-}
-
-check_patterns() {
-    local cli_js="$1"
-    local content
-    content=$(cat "$cli_js" 2>/dev/null)
-
-    local found=0 total=5
-
-    echo "Checking patch patterns..."
-
-    grep -q 'async function erY(){try{let q=m7()' <<< "$content" \
-        && { echo "  ✓ erY connectivity check"; ((found++)); } \
-        || echo "  ✗ erY connectivity check (NOT FOUND)"
-
-    grep -q 'function PJ(){if(D9())return!1' <<< "$content" \
-        && { echo "  ✓ PJ function"; ((found++)); } \
-        || echo "  ✗ PJ function (NOT FOUND)"
-
-    grep -q '3rd-party platform' <<< "$content" \
-        && { echo "  ✓ login options"; ((found++)); } \
-        || echo "  ✗ login options (NOT FOUND)"
-
-    grep -q 'onChange:(y)=>{if(y==="platform")' <<< "$content" \
-        && { echo "  ✓ login onChange"; ((found++)); } \
-        || echo "  ✗ login onChange (NOT FOUND)"
-
-    grep -q 'function MDK(){return{callModel:' <<< "$content" \
-        && { echo "  ✓ productionDeps"; ((found++)); } \
-        || echo "  ✗ productionDeps (NOT FOUND)"
-
-    echo ""
-    echo "Patterns matched: $found/$total"
-    [ "$found" -ge "$total" ]
 }
 
 is_patched() {
@@ -128,8 +93,88 @@ is_patched() {
     [ -f "$cli_js" ] && grep -q "QODER-CLAUDE-BRIDGE PATCH END" "$cli_js" 2>/dev/null
 }
 
+get_global_node_modules_root() {
+    local claude_path="$1"
+    local package_root
+    package_root=$(cd "$(dirname "$claude_path")" && pwd)
+    cd "$package_root/../.." && pwd
+}
+
+ensure_bridge_runtime_link() {
+    local claude_path="$1"
+    local node_modules_root
+    node_modules_root=$(get_global_node_modules_root "$claude_path")
+    local link_path="$node_modules_root/qoder-claude-bridge"
+
+    mkdir -p "$node_modules_root"
+
+    if [ -L "$link_path" ]; then
+        local current_target
+        current_target=$(readlink -f "$link_path" 2>/dev/null || true)
+        local desired_target
+        desired_target=$(readlink -f "$BRIDGE_DIR" 2>/dev/null || printf '%s' "$BRIDGE_DIR")
+        if [ "$current_target" = "$desired_target" ]; then
+            log_info "Bridge runtime link already exists: $link_path"
+            return 0
+        fi
+        rm "$link_path"
+    elif [ -e "$link_path" ]; then
+        log_error "Cannot create runtime link: $link_path already exists and is not a symlink"
+        return 1
+    fi
+
+    ln -s "$BRIDGE_DIR" "$link_path"
+    log_info "Created bridge runtime link: $link_path -> $BRIDGE_DIR"
+}
+
+verify_bridge_runtime_import() {
+    local claude_path="$1"
+    local package_root
+    package_root=$(cd "$(dirname "$claude_path")" && pwd)
+    (
+        cd "$package_root"
+        node --input-type=module -e "import('qoder-claude-bridge').then((mod) => { if (typeof mod.acpCallModel !== 'function') throw new Error('acpCallModel export missing'); console.log('bridge import ok'); }).catch((err) => { console.error(err instanceof Error ? err.message : String(err)); process.exit(1); })"
+    )
+}
+
+remove_bridge_runtime_link_if_owned() {
+    local claude_path="$1"
+    local node_modules_root
+    node_modules_root=$(get_global_node_modules_root "$claude_path")
+    local link_path="$node_modules_root/qoder-claude-bridge"
+    if [ -L "$link_path" ]; then
+        local current_target
+        current_target=$(readlink -f "$link_path" 2>/dev/null || true)
+        local desired_target
+        desired_target=$(readlink -f "$BRIDGE_DIR" 2>/dev/null || printf '%s' "$BRIDGE_DIR")
+        if [ "$current_target" = "$desired_target" ]; then
+            rm "$link_path"
+            log_info "Removed bridge runtime link: $link_path"
+        fi
+    fi
+}
+
 get_backup_path() {
     echo "$BACKUP_DIR/claude-code-${1}-cli.js.backup"
+}
+
+ensure_cq_alias() {
+    local alias_line="alias cq='QODER_NO_AUTH=1 claude'"
+    local rc_file
+
+    for rc_file in "$HOME/.bashrc" "$HOME/.zshrc"; do
+        if [ -f "$rc_file" ] && grep -Fqx "$alias_line" "$rc_file" 2>/dev/null; then
+            log_info "cq alias already present in $rc_file"
+            continue
+        fi
+
+        if [ ! -f "$rc_file" ]; then
+            touch "$rc_file"
+        fi
+
+        printf "\n%s\n" "$alias_line" >> "$rc_file"
+        log_info "Added cq alias to $rc_file"
+    done
 }
 
 # =============================================================================
@@ -171,6 +216,14 @@ setup_bridge() {
     fi
 }
 
+run_probe() {
+    local cli_js="$1"
+    (
+        cd "$BRIDGE_DIR"
+        CLAUDE_CODE_BUNDLE="$cli_js" node dist/patch/apply.js --check-only
+    )
+}
+
 # =============================================================================
 # Commands
 # =============================================================================
@@ -192,13 +245,24 @@ cmd_status() {
     echo "Claude Code version: $version"
     echo ""
 
+    setup_bridge
+
     if [ "$version" != "unknown" ]; then
-        if is_version_supported "$version"; then
-            log_success "Version $version is supported"
+        if is_version_known_tested "$version"; then
+            log_success "Version $version is known-tested"
         else
-            log_warn "Version $version is NOT tested/supported"
-            echo "  Supported: ${SUPPORTED_VERSIONS[*]}"
+            log_warn "Version $version is not in the known-tested list"
+            echo "  Known tested: ${KNOWN_TESTED_VERSIONS[*]}"
         fi
+    fi
+
+    echo ""
+    echo "Compatibility probe:"
+    if probe_output=$(run_probe "$claude_path" 2>&1); then
+        echo "$probe_output"
+    else
+        echo "$probe_output"
+        log_error "Bundle is not compatible with the current patcher"
     fi
 
     if is_patched "$claude_path"; then
@@ -213,6 +277,14 @@ cmd_status() {
         log_success "Backup exists: $backup_path"
     else
         log_info "No backup found for version $version"
+    fi
+
+    if verify_output=$(verify_bridge_runtime_import "$claude_path" 2>&1); then
+        log_success "Runtime import check passed"
+        echo "$verify_output"
+    else
+        log_warn "Runtime import check failed"
+        echo "$verify_output"
     fi
 
     echo ""
@@ -242,7 +314,7 @@ cmd_install() {
     local claude_path
     claude_path=$(get_claude_path) || {
         log_error "Claude Code is not installed"
-        echo "Install it with: npm install -g @anthropic-ai/claude-code@2.1.89"
+        echo "Install it with: npm install -g @anthropic-ai/claude-code"
         exit 1
     }
 
@@ -256,39 +328,31 @@ cmd_install() {
     echo "Claude Code path:    $claude_path"
     echo ""
 
-    # Version check
-    if ! is_version_supported "$version"; then
-        if [ "$FORCE_MODE" = true ]; then
-            log_warn "Unsupported version $version — skipped (force mode)"
-        else
-            log_warn "Version $version is NOT tested/supported!"
-            echo "  Supported: ${SUPPORTED_VERSIONS[*]}"
-            echo ""
-            echo "  Use --force to install anyway (risky)"
-            echo ""
-            read -r -p "Continue anyway? (y/N) " reply
-            [[ "$reply" =~ ^[Yy]$ ]] || { log_info "Cancelled"; exit 0; }
-        fi
+    if is_version_known_tested "$version"; then
+        log_success "Version $version is known-tested"
+    else
+        log_warn "Version $version is not in the known-tested list"
+        echo "  Known tested: ${KNOWN_TESTED_VERSIONS[*]}"
     fi
 
-    # Pattern check
+    setup_bridge
+
     echo ""
-    if ! check_patterns "$claude_path"; then
+    log_info "Running compatibility probe..."
+    if probe_output=$(run_probe "$claude_path" 2>&1); then
+        echo "$probe_output"
+    else
+        echo "$probe_output"
         if [ "$FORCE_MODE" = true ]; then
             echo ""
-            log_warn "Pattern check FAILED — continuing (force mode)"
-            echo -e "${RED}  ⚠️  Patch will likely fail or corrupt the bundle.${NC}"
-            echo -e "${RED}  Run ./install.sh --restore to recover.${NC}"
+            log_warn "Compatibility probe FAILED — continuing (force mode)"
+            echo -e "${RED}  ⚠️  Patch may still fail. Run ./install.sh --restore to recover.${NC}"
         else
-            log_error "Patch patterns don't match this Claude Code version!"
             echo ""
-            echo "Options:"
-            echo "  1. Wait for a bridge update for version $version"
-            echo "  2. Force install: curl ... | bash -s -- --force"
+            log_error "Bundle is not compatible with the current patcher"
+            echo "Use --force to bypass the compatibility probe (risky)."
             exit 1
         fi
-    else
-        log_success "All patch patterns matched"
     fi
 
     # Already patched?
@@ -297,9 +361,6 @@ cmd_install() {
         read -r -p "Reinstall? (y/N) " reply
         [[ "$reply" =~ ^[Yy]$ ]] || { log_info "Cancelled"; exit 0; }
     fi
-
-    # Clone/build bridge
-    setup_bridge
 
     # Create backup
     mkdir -p "$BACKUP_DIR"
@@ -320,6 +381,15 @@ cmd_install() {
     cd "$BRIDGE_DIR"
     node dist/patch/apply.js
 
+    log_info "Ensuring bridge runtime package is resolvable..."
+    ensure_bridge_runtime_link "$claude_path"
+
+    log_info "Verifying bridge runtime import..."
+    verify_bridge_runtime_import "$claude_path"
+
+    log_info "Ensuring cq alias exists in shell startup files..."
+    ensure_cq_alias
+
     echo ""
     log_success "Installation complete!"
     echo ""
@@ -331,7 +401,7 @@ cmd_install() {
     echo "  QODER_NO_AUTH=1 claude"
     echo ""
     echo "Option 2 - Add alias to ~/.bashrc or ~/.zshrc:"
-    echo "  alias claude='QODER_NO_AUTH=1 claude'"
+    echo "  alias cq='QODER_NO_AUTH=1 claude'"
     echo ""
     echo "Option 3 - Non-interactive mode:"
     echo "  claude -p 'your prompt'"
@@ -359,6 +429,8 @@ cmd_restore() {
 
     local in_place_bak="${claude_path}.qoder-bridge.bak"
 
+    setup_bridge
+
     if [ -n "$backup_path" ] && [ -f "$backup_path" ]; then
         log_info "Restoring from: $backup_path"
         cp "$backup_path" "$claude_path"
@@ -372,6 +444,8 @@ cmd_restore() {
         echo "Reinstall Claude Code: npm install -g @anthropic-ai/claude-code@$version"
         exit 1
     fi
+
+    remove_bridge_runtime_link_if_owned "$claude_path"
     echo ""
 }
 
@@ -424,7 +498,7 @@ case "$ACTION" in
         echo ""
         echo "Options:"
         echo "  (none)       Install bridge patch (clone, build, patch)"
-        echo "  --force, -f  Bypass version/pattern checks (risky)"
+        echo "  --force, -f  Bypass compatibility checks (risky)"
         echo "  --status     Show installation status"
         echo "  --restore    Restore original Claude Code from backup"
         echo "  --uninstall  Restore and clean up"
