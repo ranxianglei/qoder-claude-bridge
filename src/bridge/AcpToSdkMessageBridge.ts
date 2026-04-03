@@ -77,11 +77,45 @@ export async function* acpToSdkMessages(
       n?.()
     })
 
-  let textBuffer = ''
+  let assistantTextBuffer = ''
+  let statusBuffer = ''
+  let lastPartialText = ''
+  let lastPartialAt = 0
   const messageId = `msg_qoder_${randomUUID().replace(/-/g, '').slice(0, 24)}`
+  const PARTIAL_MIN_INTERVAL_MS = 120
+  const PARTIAL_MIN_CHARS = 24
 
   const appendStatus = (line: string): void => {
-    textBuffer += `[Qoder] ${line}\n`
+    statusBuffer += `[Qoder] ${line}\n`
+  }
+
+  const buildFinalText = (): string => {
+    if (statusBuffer && assistantTextBuffer) {
+      return `${statusBuffer}${assistantTextBuffer}`
+    }
+    return statusBuffer || assistantTextBuffer
+  }
+
+  const shouldEmitPartial = (): boolean => {
+    if (!assistantTextBuffer) return false
+    if (assistantTextBuffer === lastPartialText) return false
+
+    const now = Date.now()
+    const deltaChars = assistantTextBuffer.length - lastPartialText.length
+    const newestChar = assistantTextBuffer.at(-1) ?? ''
+    const boundaryChar = newestChar === '\n' || /[.!?。！？]/.test(newestChar)
+    const intervalElapsed = now - lastPartialAt >= PARTIAL_MIN_INTERVAL_MS
+
+    return boundaryChar || deltaChars >= PARTIAL_MIN_CHARS || intervalElapsed
+  }
+
+  function* yieldPartial(): Generator<AssistantAPIMessage> {
+    if (!shouldEmitPartial()) {
+      return
+    }
+    lastPartialText = assistantTextBuffer
+    lastPartialAt = Date.now()
+    yield buildAssistantTextMessage(messageId, assistantTextBuffer, true)
   }
 
   // yieldFinal: yield the last assistant message with stop_reason='end_turn'.
@@ -91,8 +125,10 @@ export async function* acpToSdkMessages(
   // If the buffer is empty (e.g. the turn only had tool calls), synthesise a
   // minimal text message so the content array is non-empty.
   function* yieldFinal(): Generator<AssistantAPIMessage> {
-    const text = textBuffer
-    textBuffer = ''
+    const text = buildFinalText()
+    assistantTextBuffer = ''
+    statusBuffer = ''
+    lastPartialText = ''
     if (text) {
       yield buildAssistantTextMessage(messageId, text, false /*terminal*/)
     } else {
@@ -114,7 +150,8 @@ export async function* acpToSdkMessages(
       }
 
       if (update.sessionUpdate === 'agent_message_chunk') {
-        textBuffer += update.content.text
+        assistantTextBuffer += update.content.text
+        yield* yieldPartial()
         continue
       }
 
@@ -171,7 +208,7 @@ export async function* acpToSdkMessages(
     }
 
     if (finished) {
-      console.error('[qoder-bridge] Generator finishing, textBufferLen=' + textBuffer.length)
+      console.error('[qoder-bridge] Generator finishing, textBufferLen=' + buildFinalText().length)
       yield* yieldFinal()
       console.error('[qoder-bridge] Generator complete')
       return

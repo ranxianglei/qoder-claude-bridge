@@ -218,9 +218,9 @@ describe('AcpToSdkMessageBridge', () => {
 
     const { assistant, errors } = await collect(client, sessionId)
     expect(errors).toHaveLength(0)
-    expect(assistant).toHaveLength(1)
+    expect(assistant.length).toBeGreaterThanOrEqual(1)
 
-    const onlyText = assistant[0]?.message.content.find((c) => c.type === 'text') as
+    const onlyText = assistant.at(-1)?.message.content.find((c) => c.type === 'text') as
       | { type: 'text'; text: string }
       | undefined
     expect(onlyText?.text).toBe(exactText)
@@ -228,6 +228,10 @@ describe('AcpToSdkMessageBridge', () => {
     const last = assistant.at(-1)
     expect(last?.message.stop_reason).toBe('end_turn')
     expect(last?.message.model).toBe('qoder')
+    if (assistant.length > 1) {
+      expect(assistant[0]?.message.id).toBe(last?.message.id)
+      expect(assistant[0]?.message.stop_reason).toBeNull()
+    }
     client.destroy()
   })
 
@@ -237,13 +241,12 @@ describe('AcpToSdkMessageBridge', () => {
     const sessionId = await client.newSession('/tmp/test')
 
     const { assistant } = await collect(client, sessionId)
-    expect(assistant).toHaveLength(1)
+    expect(assistant.length).toBeGreaterThanOrEqual(1)
 
     const hasToolUse = assistant.some((m) => m.message.content.some((c) => c.type === 'tool_use'))
     expect(hasToolUse).toBe(false)
 
-    const allText = assistant
-      .flatMap((m) => m.message.content)
+    const allText = (assistant.at(-1)?.message.content ?? [])
       .filter((c) => c.type === 'text')
       .map((c) => (c as { type: 'text'; text: string }).text)
       .join('')
@@ -261,10 +264,9 @@ describe('AcpToSdkMessageBridge', () => {
 
     const { assistant, errors } = await collect(client, sessionId)
     expect(errors).toHaveLength(0)
-    expect(assistant).toHaveLength(1)
+    expect(assistant.length).toBeGreaterThanOrEqual(1)
 
-    const allText = assistant
-      .flatMap((m) => m.message.content)
+    const allText = (assistant.at(-1)?.message.content ?? [])
       .filter((c) => c.type === 'text')
       .map((c) => (c as { type: 'text'; text: string }).text)
       .join('')
@@ -282,10 +284,9 @@ describe('AcpToSdkMessageBridge', () => {
 
     const { assistant, errors } = await collect(client, sessionId)
     expect(errors).toHaveLength(0)
-    expect(assistant).toHaveLength(1)
+    expect(assistant.length).toBeGreaterThanOrEqual(1)
 
-    const allText = assistant
-      .flatMap((m) => m.message.content)
+    const allText = (assistant.at(-1)?.message.content ?? [])
       .filter((c) => c.type === 'text')
       .map((c) => (c as { type: 'text'; text: string }).text)
       .join('')
@@ -309,16 +310,44 @@ describe('AcpToSdkMessageBridge', () => {
 
     const { assistant, errors } = await collect(client, sessionId)
     expect(errors).toHaveLength(0)
-    expect(assistant).toHaveLength(1)
+    expect(assistant.length).toBeGreaterThanOrEqual(1)
 
-    const text = assistant
-      .flatMap((m) => m.message.content)
+    const text = (assistant.at(-1)?.message.content ?? [])
       .filter((c) => c.type === 'text')
       .map((c) => (c as { type: 'text'; text: string }).text)
       .join('')
     expect(text).toBe('from-stop-reason')
 
-    expect(assistant[0]?.message.stop_reason).toBe('end_turn')
+    expect(assistant.at(-1)?.message.stop_reason).toBe('end_turn')
+    client.destroy()
+  })
+
+  it('streams cumulative partial assistant snapshots with a stable message id', async () => {
+    const client = makeMockClient({ MOCK_RESPONSE_TEXT: 'Streaming works across chunks.' })
+    await client.start()
+    const sessionId = await client.newSession('/tmp/test')
+
+    const { assistant, errors } = await collect(client, sessionId)
+    expect(errors).toHaveLength(0)
+    expect(assistant.length).toBeGreaterThan(1)
+
+    const ids = new Set(assistant.map((m) => m.message.id))
+    expect(ids.size).toBe(1)
+
+    const texts = assistant.map((m) => {
+      const textBlock = m.message.content.find((c) => c.type === 'text') as
+        | { type: 'text'; text: string }
+        | undefined
+      return textBlock?.text ?? ''
+    })
+
+    for (let i = 1; i < texts.length; i += 1) {
+      expect(texts[i]?.startsWith(texts[i - 1] ?? '')).toBe(true)
+    }
+
+    expect(assistant[0]?.message.stop_reason).toBeNull()
+    expect(assistant.at(-1)?.message.stop_reason).toBe('end_turn')
+    expect(texts.at(-1)).toBe('Streaming works across chunks.')
     client.destroy()
   })
 
