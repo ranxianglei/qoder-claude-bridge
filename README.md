@@ -195,6 +195,25 @@ qoder-claude-bridge/
 - 同一个 Claude chat 内复用同一个 ACP session
 - `session/load` 可跨 ACP 进程恢复上下文
 
+### 为什么当前不显示 Claude 原生工具 UI
+
+当前 bridge **不会**把 Qoder 的 `tool_call` / `tool_call_update` 伪装成 Claude 原生的 `tool_use` / `tool_result`。
+
+这是一个有意的稳定性取舍：
+
+- **优点**
+  - 避免把 Qoder 的内部工具调用误当成 Claude 自己要执行的原生工具流
+  - 避免早期版本里出现过的闪烁、重复、消失、错误执行语义等问题
+  - 更容易保持正文 streaming 和 session 语义稳定
+
+- **代价**
+  - 在 Claude TUI 里，看不到原生的工具卡片 / 工具结果 UI
+  - Qoder 工具过程主要以普通状态文本或最终汇总文本的形式出现，可见性低于 Claude 原生工具
+
+也就是说，当前“Qoder 工具信息不够显眼”**主要是 bridge 的设计选择**，不是 Claude 单方面故意隐藏所有工具信息。
+
+如果未来要恢复 Claude 原生工具 UI，就必须把 Qoder 的工具事件重新映射为 Claude 兼容的 `tool_use` / `tool_result` 语义，并正确维护 `tool_use_id`。这件事可行，但实现难度和回归风险都明显更高。
+
 ## 备份文件
 
 备份存储在：
@@ -245,6 +264,20 @@ qoder-claude-bridge/
 ```bash
 rm ~/.qoder-bridge/sessions.json
 ```
+
+### 为什么正文会流式，但工具信息不明显
+
+当前 bridge 已恢复正文的可见 streaming，但 **Qoder 工具过程不会以 Claude 原生工具 UI 展示**。
+
+这是当前版本的已知设计取舍：
+
+- 正文采用 Claude 兼容的 `stream_event` 文本增量协议，避免整段重复刷屏
+- 工具活动保留为 bridge 内部状态文本，而不是原生 `tool_use` / `tool_result`
+
+因此你会看到：
+
+- 正文回答是流式的
+- 工具细节不会像 Claude 原生 Bash / Read / Edit 那样展示成完整工具卡片
 
 ### 手动恢复
 
