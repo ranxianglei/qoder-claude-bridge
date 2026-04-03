@@ -20,21 +20,15 @@
 import { readFileSync, writeFileSync, existsSync, copyFileSync } from 'fs'
 import { resolve, dirname } from 'path'
 import { execSync } from 'child_process'
+import { fileURLToPath } from 'url'
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/**
- * The exact string in the bundle that identifies the productionDeps function.
- * Note: This marker changes between Claude Code versions (minified names).
- * v2.1.88:  function A_q(){return{callModel:
- * v2.1.89:  function MDK(){return{callModel:
- */
-const PRODUCTION_DEPS_MARKERS = [
-  'function A_q(){return{callModel:',
-  'function MDK(){return{callModel:',
-]
+const PRODUCTION_DEPS_REGEX = /function\s+([A-Za-z_$][\w$]*)\(\)\{return\{callModel:/g
+const SESSION_ID_GETTER_REGEX = /function\s+([A-Za-z_$][\w$]*)\(\)\{return\s+([A-Za-z_$][\w$]*)\.sessionId\}/g
+const CWD_GETTER_REGEX = /function\s+([A-Za-z_$][\w$]*)\(\)\{return\s+([A-Za-z_$][\w$]*)\.cwd\}/g
 
 /**
  * The connectivity check function that Claude Code runs before showing the TUI.
@@ -115,20 +109,74 @@ const LOGIN_ONCHANGE_PATCHED =
  * Generate the patched function body.
  * The function name must match the original marker (A_q or MDK etc).
  */
-function generatePatchInjection(originalFuncName: string): string {
+export function detectStateAccessors(bundleText: string): {
+  sessionIdGetterName?: string
+  cwdGetterName?: string
+} {
+  const sessionIdMatch = [...bundleText.matchAll(SESSION_ID_GETTER_REGEX)][0]
+  const cwdMatch = [...bundleText.matchAll(CWD_GETTER_REGEX)][0]
+  const result: {
+    sessionIdGetterName?: string
+    cwdGetterName?: string
+  } = {}
+
+  if (sessionIdMatch?.[1]) {
+    result.sessionIdGetterName = sessionIdMatch[1]
+  }
+  if (cwdMatch?.[1]) {
+    result.cwdGetterName = cwdMatch[1]
+  }
+
+  return result
+}
+
+export function generatePatchInjection(
+  originalFuncName: string,
+  stateAccessors?: { sessionIdGetterName?: string; cwdGetterName?: string },
+): string {
+  const sessionIdGetterName = stateAccessors?.sessionIdGetterName
+  const cwdGetterName = stateAccessors?.cwdGetterName
+  const directStateInjection = [
+    cwdGetterName
+      ? `    if (typeof ${cwdGetterName} === 'function') {
+      params.options = { ...params.options, cwd: ${cwdGetterName}() };
+    }`
+      : '',
+    sessionIdGetterName
+      ? `    if (typeof ${sessionIdGetterName} === 'function') {
+      params.options = { ...params.options, sessionId: ${sessionIdGetterName}() };
+    }`
+      : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+
   return `
 // === QODER-CLAUDE-BRIDGE PATCH START ===
 let __qoderCallModel = null;
+let __qoderBridgeImported = false;
+function __qoderBridgeError(phase, cause) {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  return new Error('[qoder-bridge] ' + phase + ' failed: ' + message, { cause });
+}
+function __qoderCliLaunchInitFailure(cause) {
+  const message = cause instanceof Error ? cause.name + ': ' + cause.message : String(cause);
+  return /(?:\\bqodercli\\b.*(?:spawn|exited|initialize)|spawn .*\\bqodercli\\b|ENOENT|process not running)/i.test(message);
+}
 async function __loadQoderBridge() {
   if (!__qoderCallModel) {
     try {
       console.error('[qoder-bridge] Loading bridge module...');
       const mod = await import('qoder-claude-bridge');
+      __qoderBridgeImported = true;
+      if (typeof mod.acpCallModel !== 'function') {
+        throw new Error('qoder-claude-bridge export acpCallModel is missing or not a function');
+      }
       __qoderCallModel = mod.acpCallModel;
       console.error('[qoder-bridge] Bridge module loaded, acpCallModel=', typeof __qoderCallModel);
     } catch (e) {
-      console.error('[qoder-bridge] Failed to load bridge:', e.message);
-      __qoderCallModel = null;
+      console.error('[qoder-bridge] Bridge startup failed during load/export:', e instanceof Error ? e.message : String(e));
+      throw __qoderBridgeError(__qoderBridgeImported ? 'bridge-export' : 'bridge-load', e);
     }
   }
   return __qoderCallModel;
@@ -136,18 +184,17 @@ async function __loadQoderBridge() {
 async function* __qoderCallModelWrapper(params) {
   console.error('[qoder-bridge] __qoderCallModelWrapper called');
   const fn = await __loadQoderBridge();
-  if (!fn) {
-    console.error('[qoder-bridge] Bridge not available');
-    throw new Error('[qoder-bridge] Bridge not available — check QODER_CLI_CMD');
-  }
   // Inject cwd and sessionId from Claude Code state if available
   try {
-    const stateModule = await import('./entry.js');
-    if (stateModule && typeof stateModule.getCwd === 'function') {
-      params.options = { ...params.options, cwd: stateModule.getCwd() };
-    }
-    if (stateModule && typeof stateModule.getSessionId === 'function') {
-      params.options = { ...params.options, sessionId: stateModule.getSessionId() };
+${directStateInjection || '    const __qoderNoDirectStateAccessors = true;'}
+    if (!params.options?.cwd || !params.options?.sessionId) {
+      const stateModule = await import('./entry.js');
+      if (!params.options?.cwd && stateModule && typeof stateModule.getCwd === 'function') {
+        params.options = { ...params.options, cwd: stateModule.getCwd() };
+      }
+      if (!params.options?.sessionId && stateModule && typeof stateModule.getSessionId === 'function') {
+        params.options = { ...params.options, sessionId: stateModule.getSessionId() };
+      }
     }
   } catch (_) { /* state injection is best-effort */ }
   console.error('[qoder-bridge] About to delegate to acpCallModel');
@@ -158,14 +205,163 @@ async function* __qoderCallModelWrapper(params) {
     }
     console.error('[qoder-bridge] acpCallModel iteration completed');
   } catch (e) {
-    console.error('[qoder-bridge] acpCallModel error:', e.message);
-    throw e;
+    console.error('[qoder-bridge] acpCallModel error:', e instanceof Error ? e.message : String(e));
+    const hint = __qoderCliLaunchInitFailure(e) ? ' — check QODER_CLI_CMD' : '';
+    throw new Error('[qoder-bridge] bridge-runtime failed' + hint + ': ' + (e instanceof Error ? e.message : String(e)), { cause: e });
   }
 }
 function ${originalFuncName}(){return{callModel:__qoderCallModelWrapper,`.trimStart()
 }
 
 const PATCH_END_MARKER = '// === QODER-CLAUDE-BRIDGE PATCH END ==='
+
+export type Compatibility =
+  | 'compatible'
+  | 'compatible_with_warnings'
+  | 'already_patched'
+  | 'incompatible'
+
+export interface ProbeStatus {
+  status: 'compatible' | 'missing' | 'partial' | 'ambiguous'
+  reason?: string
+}
+
+export interface ProbeResult {
+  compatibility: Compatibility
+  productionDeps: ProbeStatus & {
+    functionName?: string
+    matches: number
+    marker?: string
+  }
+  connectivity: ProbeStatus
+  authGate: ProbeStatus
+  loginUi: ProbeStatus
+  stateAccessors: {
+    sessionIdGetterName?: string
+    cwdGetterName?: string
+  }
+  reasons: string[]
+  warnings: string[]
+}
+
+export function probeBundleText(bundleText: string): ProbeResult {
+  if (bundleText.includes(PATCH_END_MARKER)) {
+    return {
+      compatibility: 'already_patched',
+        productionDeps: { status: 'compatible', matches: 0 },
+        connectivity: { status: 'missing', reason: 'connectivity_probe_missing' },
+        authGate: { status: 'missing', reason: 'pj_probe_missing' },
+        loginUi: { status: 'missing', reason: 'login_ui_missing' },
+        stateAccessors: {},
+        reasons: ['already_patched'],
+        warnings: [],
+      }
+  }
+
+  const matches = [...bundleText.matchAll(PRODUCTION_DEPS_REGEX)]
+  const firstMatch = matches[0]
+  const firstFunctionName = firstMatch?.[1]
+  const firstMarker = firstMatch?.[0]
+  const productionDeps: ProbeResult['productionDeps'] =
+    matches.length === 1 && firstFunctionName && firstMarker
+      ? {
+          status: 'compatible',
+          matches: 1,
+          functionName: firstFunctionName,
+          marker: firstMarker,
+        }
+      : matches.length === 0
+        ? { status: 'missing', reason: 'production_deps_missing', matches: 0 }
+        : { status: 'ambiguous', reason: 'production_deps_ambiguous', matches: matches.length }
+
+  const connectivity: ProbeStatus = bundleText.includes(ERY_ORIGINAL)
+    ? { status: 'compatible' }
+    : { status: 'missing', reason: 'connectivity_probe_missing' }
+
+  const authGate: ProbeStatus = bundleText.includes(PJ_ORIGINAL)
+    ? { status: 'compatible' }
+    : { status: 'missing', reason: 'pj_probe_missing' }
+
+  const hasLoginOptions = bundleText.includes(LOGIN_OPTIONS_ORIGINAL)
+  const hasLoginOnChange = bundleText.includes(LOGIN_ONCHANGE_ORIGINAL)
+  const stateAccessors = detectStateAccessors(bundleText)
+  const loginUi: ProbeStatus = hasLoginOptions && hasLoginOnChange
+    ? { status: 'compatible' }
+    : hasLoginOptions || hasLoginOnChange
+      ? { status: 'partial', reason: 'login_ui_partial' }
+      : { status: 'missing', reason: 'login_ui_missing' }
+
+  const reasons: string[] = []
+  const warnings: string[] = []
+
+  if (productionDeps.status !== 'compatible') {
+    reasons.push(productionDeps.reason ?? 'production_deps_missing')
+  }
+  if (connectivity.reason) warnings.push(connectivity.reason)
+  if (authGate.reason) warnings.push(authGate.reason)
+  if (loginUi.reason) warnings.push(loginUi.reason)
+
+  const compatibility: Compatibility =
+    reasons.length > 0
+      ? 'incompatible'
+      : warnings.length > 0
+        ? 'compatible_with_warnings'
+        : 'compatible'
+
+  return {
+    compatibility,
+    productionDeps,
+    connectivity,
+    authGate,
+    loginUi,
+    stateAccessors,
+    reasons,
+    warnings,
+  }
+}
+
+export function formatProbeReport(probe: ProbeResult): string {
+  const lines = [`Compatibility: ${probe.compatibility}`]
+  lines.push(`productionDeps: ${probe.productionDeps.status}${probe.productionDeps.functionName ? ` (${probe.productionDeps.functionName})` : ''}`)
+  lines.push(`connectivity: ${probe.connectivity.status}`)
+  lines.push(`authGate: ${probe.authGate.status}`)
+  lines.push(`loginUi: ${probe.loginUi.status}`)
+  if (probe.reasons.length > 0) lines.push(`Reasons: ${probe.reasons.join(', ')}`)
+  if (probe.warnings.length > 0) lines.push(`Warnings: ${probe.warnings.join(', ')}`)
+  return lines.join('\n')
+}
+
+export function applyPatchText(original: string): { patched: string; probe: ProbeResult } {
+  const probe = probeBundleText(original)
+  if (probe.compatibility === 'incompatible') {
+    throw new Error(formatProbeReport(probe))
+  }
+  if (probe.compatibility === 'already_patched') {
+    return { patched: original, probe }
+  }
+
+  let patched = original
+  if (probe.connectivity.status === 'compatible') {
+    patched = patched.replace(ERY_ORIGINAL, escapeReplacement(ERY_PATCHED))
+  }
+  if (probe.authGate.status === 'compatible') {
+    patched = patched.replace(PJ_ORIGINAL, escapeReplacement(PJ_PATCHED))
+  }
+  if (probe.loginUi.status === 'compatible') {
+    patched = patched.replace(LOGIN_OPTIONS_ORIGINAL, escapeReplacement(LOGIN_OPTIONS_PATCHED))
+    patched = patched.replace(LOGIN_ONCHANGE_ORIGINAL, escapeReplacement(LOGIN_ONCHANGE_PATCHED))
+  }
+
+  const marker = probe.productionDeps.marker
+  const functionName = probe.productionDeps.functionName
+  if (!marker || !functionName) {
+    throw new Error(formatProbeReport(probe))
+  }
+
+  const patchInjection = generatePatchInjection(functionName, probe.stateAccessors)
+  patched = patched.replace(marker, patchInjection) + '\n' + PATCH_END_MARKER
+  return { patched, probe }
+}
 
 // ---------------------------------------------------------------------------
 // Locate Claude Code bundle
@@ -225,84 +421,51 @@ function escapeReplacement(str: string): string {
   return str.replace(/\$/g, '$$$$')
 }
 
-function applyPatch(bundlePath: string): void {
+export function applyPatch(bundlePath: string): void {
   const original = readFileSync(bundlePath, 'utf-8')
 
-  // Check if already patched
-  if (original.includes(PATCH_END_MARKER)) {
+  const probe = probeBundleText(original)
+  if (probe.compatibility === 'already_patched') {
     console.log('Bundle is already patched — nothing to do.')
     return
   }
-
-  // Find which marker matches this bundle version
-  let matchedMarker: string | null = null
-  let originalFuncName: string | null = null
-  for (const marker of PRODUCTION_DEPS_MARKERS) {
-    if (original.includes(marker)) {
-      matchedMarker = marker
-      // Extract function name from marker: "function Xxx(){return{callModel:"
-      const match = marker.match(/function (\w+)\(\)/)
-      originalFuncName = match?.[1] ?? null
-      break
-    }
+  if (probe.compatibility === 'incompatible') {
+    throw new Error(formatProbeReport(probe))
   }
 
-  if (!matchedMarker || !originalFuncName) {
-    throw new Error(
-      `Could not find productionDeps marker in bundle.\n` +
-      `Tried: ${JSON.stringify(PRODUCTION_DEPS_MARKERS)}\n` +
-      `The Claude Code version may have changed. ` +
-      `Check DESIGN.md for guidance on updating the patch.`,
-    )
-  }
-
-  console.log(`Detected marker: ${matchedMarker}`)
-
-  // Backup original
   const backupPath = bundlePath + '.qoder-bridge.bak'
-  if (!existsSync(backupPath)) {
+  if (existsSync(backupPath)) {
+    const backup = readFileSync(backupPath, 'utf-8')
+    if (backup.includes(PATCH_END_MARKER)) {
+      throw new Error('Existing backup appears patched: backup_looks_patched')
+    }
+    console.log(`Backup already exists: ${backupPath}`)
+  } else {
     copyFileSync(bundlePath, backupPath)
     console.log(`Backup written: ${backupPath}`)
-  } else {
-    console.log(`Backup already exists: ${backupPath}`)
   }
 
-  // Build patched content:
-  // (1) replace erY() connectivity check — bypass api.anthropic.com ping
-  // (2) patch PJ() to check QODER_NO_AUTH env var
-  // (3) add Qoder login options and onChange handler
-  // (4) inject callModel wrapper (productionDeps)
-  let patched = original
-  if (patched.includes(ERY_ORIGINAL)) {
-    patched = patched.replace(ERY_ORIGINAL, escapeReplacement(ERY_PATCHED))
+  const { patched, probe: applyProbe } = applyPatchText(original)
+
+  if (applyProbe.connectivity.status === 'compatible') {
     console.log('Patched erY() connectivity check.')
   } else {
     console.warn('WARNING: Could not find erY() connectivity check — interactive mode may show a network error.')
   }
 
-  if (patched.includes(PJ_ORIGINAL)) {
-    patched = patched.replace(PJ_ORIGINAL, escapeReplacement(PJ_PATCHED))
+  if (applyProbe.authGate.status === 'compatible') {
     console.log('Patched PJ() to respect QODER_NO_AUTH env var.')
   } else {
     console.warn('WARNING: Could not find PJ() — QODER_NO_AUTH bypass may not work.')
   }
 
-  if (patched.includes(LOGIN_OPTIONS_ORIGINAL)) {
-    patched = patched.replace(LOGIN_OPTIONS_ORIGINAL, escapeReplacement(LOGIN_OPTIONS_PATCHED))
-    console.log('Patched login screen: added Qoder option.')
+  if (applyProbe.loginUi.status === 'compatible') {
+    console.log('Patched login screen and onChange handler.')
+  } else if (applyProbe.loginUi.status === 'partial') {
+    console.warn('WARNING: Login UI patch skipped because only part of the expected structure was found.')
   } else {
-    console.warn('WARNING: Could not find login options array — Qoder login option not added.')
+    console.warn('WARNING: Could not find login UI structures — Qoder login option not added.')
   }
-
-  if (patched.includes(LOGIN_ONCHANGE_ORIGINAL)) {
-    patched = patched.replace(LOGIN_ONCHANGE_ORIGINAL, escapeReplacement(LOGIN_ONCHANGE_PATCHED))
-    console.log('Patched login onChange: Qoder selection skips auth.')
-  } else {
-    console.warn('WARNING: Could not find login onChange handler — Qoder selection may not work.')
-  }
-
-  const patchInjection = generatePatchInjection(originalFuncName)
-  patched = patched.replace(matchedMarker, patchInjection) + '\n' + PATCH_END_MARKER
 
   writeFileSync(bundlePath, patched, 'utf-8')
   console.log(`\nPatch applied successfully to: ${bundlePath}`)
@@ -314,5 +477,21 @@ function applyPatch(bundlePath: string): void {
 // Entry point
 // ---------------------------------------------------------------------------
 
-const bundlePath = process.env['CLAUDE_CODE_BUNDLE'] ?? findClaudeCodeBundle()
-applyPatch(bundlePath)
+export function main(): void {
+  const args = new Set(process.argv.slice(2))
+  const bundlePath = process.env['CLAUDE_CODE_BUNDLE'] ?? findClaudeCodeBundle()
+  if (args.has('--check-only')) {
+    const probe = probeBundleText(readFileSync(bundlePath, 'utf-8'))
+    if (args.has('--json')) {
+      console.log(JSON.stringify(probe, null, 2))
+    } else {
+      console.log(formatProbeReport(probe))
+    }
+    process.exit(probe.compatibility === 'incompatible' ? 1 : 0)
+  }
+  applyPatch(bundlePath)
+}
+
+if (process.argv[1] && resolve(fileURLToPath(import.meta.url)) === resolve(process.argv[1])) {
+  main()
+}
