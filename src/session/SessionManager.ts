@@ -100,7 +100,7 @@ export class SessionManager {
     })
 
     await client.start()
-    const acpSessionId = await client.newSession(cwd)
+    const acpSessionId = await this.tryRestoreSession(claudeSessionId, client, cwd)
 
     const entry: SessionEntry = {
       client,
@@ -113,6 +113,27 @@ export class SessionManager {
     this.sessions.set(claudeSessionId, entry)
     this.persistMappings()
     return entry
+  }
+
+  async createEphemeralSession(cwd: string): Promise<SessionEntry> {
+    this.logger.warn('Creating ephemeral ACP session without Claude sessionId', { cwd })
+
+    const client = new AcpClient({
+      cmd: this.config.qoderCliCmd,
+      workdir: cwd,
+      logger: this.logger,
+    })
+
+    await client.start()
+    const acpSessionId = await client.newSession(cwd)
+
+    return {
+      client,
+      acpSessionId,
+      cwd,
+      lastUsed: Date.now(),
+      activeController: null,
+    }
   }
 
   /**
@@ -223,6 +244,7 @@ export class SessionManager {
         return hint.acpSessionId
       } catch (err) {
         this.logger.warn('Failed to restore persisted session, creating new', err)
+        delete this._restorable[claudeSessionId]
       }
     }
     return client.newSession(cwd)

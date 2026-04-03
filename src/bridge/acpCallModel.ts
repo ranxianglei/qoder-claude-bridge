@@ -19,6 +19,7 @@ import type { Logger } from '../acp/AcpClient.js'
 
 let _sessionManager: SessionManager | null = null
 let _logger: Logger | null = null
+let _warnedMissingSessionId = false
 
 function getLogger(): Logger {
   if (_logger) return _logger
@@ -88,17 +89,28 @@ export async function* acpCallModel(
     config.defaultWorkdir ??
     homedir()
 
-  // --- Resolve session ID ---
-  // Injected by the patch from STATE.sessionId; fall back to a stable hash
-  const sessionId = options.sessionId ?? deriveSessionId(messages)
+  const claudeSessionId = options.sessionId
+  const hasDurableSession = typeof claudeSessionId === 'string' && claudeSessionId.length > 0
 
-  logger.info('acpCallModel called', { sessionId, cwd, model: options.model })
+  if (!hasDurableSession && !_warnedMissingSessionId) {
+    _warnedMissingSessionId = true
+    logger.warn('Claude sessionId unavailable; using ephemeral ACP sessions without durable restore')
+  }
 
-  // --- Cancel any in-flight task for this session ---
-  await sessionManager.cancelActiveTask(sessionId)
+  logger.info('acpCallModel called', {
+    sessionId: claudeSessionId ?? '(ephemeral)',
+    cwd,
+    model: options.model,
+    durableSession: hasDurableSession,
+  })
 
-  // --- Get or create ACP session ---
-  const session = await sessionManager.getOrCreateSession(sessionId, cwd)
+  if (hasDurableSession) {
+    await sessionManager.cancelActiveTask(claudeSessionId)
+  }
+
+  const session = hasDurableSession
+    ? await sessionManager.getOrCreateSession(claudeSessionId, cwd)
+    : await sessionManager.createEphemeralSession(cwd)
 
   // --- Switch Qoder model if specified ---
   const qoderModel = toQoderModel(options.model, config.modelDefault)
@@ -117,38 +129,21 @@ export async function* acpCallModel(
   // --- Register abort controller ---
   const controller = new AbortController()
   const combinedSignal = combineSignals(signal, controller.signal)
-  sessionManager.setActiveController(sessionId, controller)
+  if (hasDurableSession) {
+    sessionManager.setActiveController(claudeSessionId, controller)
+  }
 
   try {
     console.error('[qoder-bridge] About to delegate to acpToSdkMessages')
     yield* acpToSdkMessages(session, acpContent, combinedSignal)
     console.error('[qoder-bridge] acpToSdkMessages completed')
   } finally {
-    sessionManager.clearActiveController(sessionId)
+    if (hasDurableSession) {
+      sessionManager.clearActiveController(claudeSessionId)
+    } else {
+      session.client.destroy()
+    }
   }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Derive a stable session ID from the first user message content when no
- * explicit session ID is provided.  This mirrors qoderclaw's MD5-based
- * fallback but uses a simpler hex hash.
- */
-function deriveSessionId(messages: Message[]): string {
-  const firstUser = messages.find((m) => m.type === 'user') as
-    | { message?: { content?: unknown } }
-    | undefined
-  const seed = JSON.stringify(firstUser?.message?.content ?? 'default')
-  // Simple djb2-like hash — good enough for a fallback session key
-  let h = 5381
-  for (let i = 0; i < seed.length; i++) {
-    h = ((h << 5) + h) ^ seed.charCodeAt(i)
-    h = h >>> 0
-  }
-  return `derived_${h.toString(16).padStart(8, '0')}`
 }
 
 /**
