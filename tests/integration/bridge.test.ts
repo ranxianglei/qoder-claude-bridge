@@ -21,20 +21,19 @@ import type { AssistantAPIMessage, UserMessage } from '../../src/types/claudeCod
 import type { SessionEntry } from '../../src/session/SessionManager.js'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
-const MOCK_FIXTURE = resolve(__dirname, 'fixtures/mock-qodercli.ts')
+const MOCK_FIXTURE = resolve(__dirname, 'fixtures/mock-qodercli.cjs')
 
 // ---------------------------------------------------------------------------
 // Factory helpers
 // ---------------------------------------------------------------------------
 
-/** Build an AcpClient that runs mock-qodercli via tsx. */
 function makeMockClient(mockEnv: Record<string, string> = {}): AcpClient {
   return new AcpClient({
     cmd: 'unused', // overridden by spawnFn
     workdir: '/tmp',
     logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
     spawnFn: (_cmd: string, _args: string[], opts: SpawnOptions) =>
-      spawn('tsx', [MOCK_FIXTURE], {
+      spawn(process.execPath, [MOCK_FIXTURE], {
         ...opts,
         env: { ...process.env, ...mockEnv },
       }),
@@ -211,20 +210,20 @@ describe('MessagesToAcpAdapter', () => {
 describe('AcpToSdkMessageBridge', () => {
   afterEach(() => resetConfig())
 
-  it('yields text in AssistantAPIMessages and ends with end_turn', async () => {
-    const client = makeMockClient({ MOCK_RESPONSE_TEXT: 'Works!' })
+  it('yields one finalized assistant text message and preserves exact text', async () => {
+    const exactText = '  Works!  \n'
+    const client = makeMockClient({ MOCK_RESPONSE_TEXT: exactText })
     await client.start()
     const sessionId = await client.newSession('/tmp/test')
 
     const { assistant, errors } = await collect(client, sessionId)
     expect(errors).toHaveLength(0)
+    expect(assistant).toHaveLength(1)
 
-    const allText = assistant
-      .flatMap((m) => m.message.content)
-      .filter((c) => c.type === 'text')
-      .map((c) => (c as { type: 'text'; text: string }).text)
-      .join('')
-    expect(allText).toContain('Works!')
+    const onlyText = assistant[0]?.message.content.find((c) => c.type === 'text') as
+      | { type: 'text'; text: string }
+      | undefined
+    expect(onlyText?.text).toBe(exactText)
 
     const last = assistant.at(-1)
     expect(last?.message.stop_reason).toBe('end_turn')
@@ -232,16 +231,94 @@ describe('AcpToSdkMessageBridge', () => {
     client.destroy()
   })
 
-  it('yields tool_use block when mock emits tool_call', async () => {
+  it('surfaces tool activity as inert text and does not emit tool_use blocks', async () => {
     const client = makeMockClient({ MOCK_TOOL_CALL: '1', MOCK_RESPONSE_TEXT: 'done' })
     await client.start()
     const sessionId = await client.newSession('/tmp/test')
 
     const { assistant } = await collect(client, sessionId)
-    const hasToolUse = assistant.some((m) =>
-      m.message.content.some((c) => c.type === 'tool_use'),
-    )
-    expect(hasToolUse).toBe(true)
+    expect(assistant).toHaveLength(1)
+
+    const hasToolUse = assistant.some((m) => m.message.content.some((c) => c.type === 'tool_use'))
+    expect(hasToolUse).toBe(false)
+
+    const allText = assistant
+      .flatMap((m) => m.message.content)
+      .filter((c) => c.type === 'text')
+      .map((c) => (c as { type: 'text'; text: string }).text)
+      .join('')
+
+    expect(allText).toContain('[Qoder] tool_call `Bash`')
+    expect(allText).toContain('[Qoder] tool_call_update tc_mock_1:')
+    expect(allText).toContain('done')
+    client.destroy()
+  })
+
+  it('handles tool_call_update content when rawOutput is absent', async () => {
+    const client = makeMockClient({ MOCK_TOOL_CALL_CONTENT_ONLY: '1', MOCK_RESPONSE_TEXT: 'done' })
+    await client.start()
+    const sessionId = await client.newSession('/tmp/test')
+
+    const { assistant, errors } = await collect(client, sessionId)
+    expect(errors).toHaveLength(0)
+    expect(assistant).toHaveLength(1)
+
+    const allText = assistant
+      .flatMap((m) => m.message.content)
+      .filter((c) => c.type === 'text')
+      .map((c) => (c as { type: 'text'; text: string }).text)
+      .join('')
+
+    expect(allText).toContain('[Qoder] tool_call `Bash`')
+    expect(allText).toContain('[Qoder] tool_call_update tc_mock_1: hello from content-only')
+    expect(allText).toContain('done')
+    client.destroy()
+  })
+
+  it('renders structured tool payloads without object stringification', async () => {
+    const client = makeMockClient({ MOCK_TOOL_CALL_STRUCTURED: '1', MOCK_RESPONSE_TEXT: 'done' })
+    await client.start()
+    const sessionId = await client.newSession('/tmp/test')
+
+    const { assistant, errors } = await collect(client, sessionId)
+    expect(errors).toHaveLength(0)
+    expect(assistant).toHaveLength(1)
+
+    const allText = assistant
+      .flatMap((m) => m.message.content)
+      .filter((c) => c.type === 'text')
+      .map((c) => (c as { type: 'text'; text: string }).text)
+      .join('')
+
+    expect(allText).toContain('[Qoder] tool_call Read')
+    expect(allText).toContain('src/math.js')
+    expect(allText).toContain('{"lines":7,"bytes":88}')
+    expect(allText).not.toContain('[object Object]')
+    expect(allText).toContain('done')
+    client.destroy()
+  })
+
+  it('completes when session/prompt returns stopReason without agent_finish', async () => {
+    const client = makeMockClient({
+      MOCK_RESPONSE_TEXT: 'from-stop-reason',
+      MOCK_STOP_REASON: 'end_turn',
+      MOCK_NO_AGENT_FINISH: '1',
+    })
+    await client.start()
+    const sessionId = await client.newSession('/tmp/test')
+
+    const { assistant, errors } = await collect(client, sessionId)
+    expect(errors).toHaveLength(0)
+    expect(assistant).toHaveLength(1)
+
+    const text = assistant
+      .flatMap((m) => m.message.content)
+      .filter((c) => c.type === 'text')
+      .map((c) => (c as { type: 'text'; text: string }).text)
+      .join('')
+    expect(text).toBe('from-stop-reason')
+
+    expect(assistant[0]?.message.stop_reason).toBe('end_turn')
     client.destroy()
   })
 

@@ -123,7 +123,7 @@ export interface AcpMessageChunkUpdate extends AcpUpdateBase {
 export interface AcpToolCallUpdate extends AcpUpdateBase {
   sessionUpdate: 'tool_call'
   toolCallId: string
-  title: string
+  title: unknown
   rawInput: unknown
   kind: string
 }
@@ -131,8 +131,13 @@ export interface AcpToolCallUpdate extends AcpUpdateBase {
 export interface AcpToolCallResultUpdate extends AcpUpdateBase {
   sessionUpdate: 'tool_call_update'
   toolCallId: string
-  rawOutput: Array<{ content: string; exitCode?: number }>
-  content?: Array<{ content: { text: string } }>
+  status?: string
+  title?: unknown
+  kind?: string
+  rawOutput?: unknown
+  content?: unknown
+  locations?: unknown
+  _meta?: Record<string, unknown>
 }
 
 export interface AcpAgentErrorUpdate extends AcpUpdateBase {

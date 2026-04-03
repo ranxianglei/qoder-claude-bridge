@@ -18,9 +18,9 @@ import type {
  *
  * ACP update → yield mapping:
  *   agent_thought_chunk  → (ignored — internal thinking stream)
- *   agent_message_chunk  → AssistantMessage with text content block
- *   tool_call            → AssistantMessage with tool_use content block
- *   tool_call_update     → (absorbed — tool results handled by Qoder internally)
+ *   agent_message_chunk  → buffered assistant text (single final message per turn)
+ *   tool_call            → buffered inert status text (no Claude tool_use semantics)
+ *   tool_call_update     → buffered inert status text (no tool_result semantics)
  *   agent_finish         → final AssistantMessage with stop_reason='end_turn', then return
  *   agent_error          → SystemAPIErrorMessage, then return
  *
@@ -77,23 +77,11 @@ export async function* acpToSdkMessages(
       n?.()
     })
 
-  // Accumulate text chunks into a single assistant message per "turn".
-  // Qoder streams many small chunks; we buffer and flush on tool_call or finish.
   let textBuffer = ''
   const messageId = `msg_qoder_${randomUUID().replace(/-/g, '').slice(0, 24)}`
 
-  // First yield stream_request_start to match Claude Code's expected protocol
-  // Note: This is a simple signal that the stream is starting, it's not processed as a message
-  yield { type: 'stream_request_start' }
-
-  // flushText(terminal=false): flush buffered text as a partial or final message.
-  // When terminal=true, the message gets stop_reason='end_turn' so Claude Code's
-  // oE4() validation passes (it checks that the last assistant message has text content).
-  const flushText = (terminal = false): AssistantAPIMessage | null => {
-    const text = textBuffer.trim()
-    textBuffer = ''
-    if (!text) return null
-    return buildAssistantTextMessage(messageId, text, !terminal)
+  const appendStatus = (line: string): void => {
+    textBuffer += `[Qoder] ${line}\n`
   }
 
   // yieldFinal: yield the last assistant message with stop_reason='end_turn'.
@@ -103,7 +91,7 @@ export async function* acpToSdkMessages(
   // If the buffer is empty (e.g. the turn only had tool calls), synthesise a
   // minimal text message so the content array is non-empty.
   function* yieldFinal(): Generator<AssistantAPIMessage> {
-    const text = textBuffer.trim()
+    const text = textBuffer
     textBuffer = ''
     if (text) {
       yield buildAssistantTextMessage(messageId, text, false /*terminal*/)
@@ -127,25 +115,30 @@ export async function* acpToSdkMessages(
 
       if (update.sessionUpdate === 'agent_message_chunk') {
         textBuffer += update.content.text
-        // Yield incremental text so Claude Code TUI can update in real time
-        console.error('[qoder-bridge] Yielding message chunk, textLen=' + update.content.text.length)
-        yield buildAssistantTextMessage(messageId, update.content.text, /*partial*/ true)
         continue
       }
 
       if (update.sessionUpdate === 'tool_call') {
-        // Flush any buffered text before the tool call
-        const flushed = flushText()
-        if (flushed) yield flushed
-
-        // Yield a tool_use assistant message so Claude Code can display it
-        yield buildToolUseMessage(update.toolCallId, update.title, update.rawInput)
+        appendStatus(`tool_call ${formatUnknownValue(update.title)}`)
         continue
       }
 
       if (update.sessionUpdate === 'tool_call_update') {
-        // Qoder handles tool execution internally — we don't re-run tools.
-        // Just ignore these; the results will appear in subsequent text chunks.
+        const outputs = extractToolCallOutputs(update).join('\n')
+        if (outputs) {
+          appendStatus(`tool_call_update ${update.toolCallId}: ${outputs}`)
+        } else {
+          const statusParts = [
+            update.status ? `status=${update.status}` : '',
+            update.kind ? `kind=${update.kind}` : '',
+            update.title ? `title=${formatUnknownValue(update.title)}` : '',
+          ].filter(Boolean)
+          appendStatus(
+            statusParts.length > 0
+              ? `tool_call_update ${update.toolCallId} ${statusParts.join(' ')}`
+              : `tool_call_update ${update.toolCallId}`,
+          )
+        }
         continue
       }
 
@@ -156,8 +149,6 @@ export async function* acpToSdkMessages(
       }
 
       if (update.sessionUpdate === 'agent_error') {
-        const flushed = flushText()
-        if (flushed) yield flushed
         const errMsg: SystemAPIErrorMessage = {
           type: 'system',
           subtype: 'api_error',
@@ -170,8 +161,6 @@ export async function* acpToSdkMessages(
 
     // Check terminal conditions before waiting
     if (acpError) {
-      const flushed = flushText()
-      if (flushed) yield flushed
       const errMsg: SystemAPIErrorMessage = {
         type: 'system',
         subtype: 'api_error',
@@ -218,33 +207,155 @@ function buildAssistantTextMessage(
   }
 }
 
-function buildToolUseMessage(
-  toolCallId: string,
-  title: string,
-  rawInput: unknown,
-): AssistantAPIMessage {
-  // Parse the tool name from the ACP title (format: "`ToolName`" or "ToolName")
-  const toolName = title.replace(/`/g, '').split('(')[0]?.trim() ?? 'UnknownTool'
+function extractToolCallOutputs(update: Extract<AcpUpdate, { sessionUpdate: 'tool_call_update' }>): string[] {
+  const rawOutputs = collectToolCallRawOutput(update.rawOutput)
 
-  return {
-    type: 'assistant',
-    message: {
-      id: `msg_tool_${toolCallId}`,
-      type: 'message',
-      role: 'assistant',
-      content: [
-        {
-          type: 'tool_use',
-          id: toolCallId,
-          name: toolName,
-          input: (rawInput as Record<string, unknown>) ?? {},
-        },
-      ],
-      model: 'qoder',
-      stop_reason: 'tool_use',
-      stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0 },
-    },
+  if (rawOutputs.length > 0) {
+    return rawOutputs
+  }
+
+  const contentOutputs = collectToolCallContent(update.content)
+  if (contentOutputs.length > 0) {
+    return contentOutputs
+  }
+
+  return collectToolCallMeta(update._meta)
+}
+
+function collectToolCallRawOutput(rawOutput: unknown): string[] {
+  if (!Array.isArray(rawOutput)) {
+    return formatUnknownValue(rawOutput) ? [formatUnknownValue(rawOutput)] : []
+  }
+
+  return rawOutput
+    .flatMap((entry) => {
+      if (!isRecord(entry)) {
+        return formatUnknownValue(entry) ? [formatUnknownValue(entry)] : []
+      }
+
+      const rendered = formatUnknownValue(entry.content)
+      const exitCode = typeof entry.exitCode === 'number' ? ` exit=${entry.exitCode}` : ''
+      if (rendered) {
+        return [`${rendered}${exitCode}`]
+      }
+      if (exitCode) {
+        return [exitCode.trim()]
+      }
+      return []
+    })
+    .filter((line) => line.length > 0)
+}
+
+function collectToolCallContent(content: unknown): string[] {
+  if (!Array.isArray(content)) {
+    return formatUnknownValue(content) ? [formatUnknownValue(content)] : []
+  }
+
+  return content
+    .flatMap((entry) => {
+      if (!isRecord(entry)) {
+        return formatUnknownValue(entry) ? [formatUnknownValue(entry)] : []
+      }
+
+      const entryType = typeof entry.type === 'string' ? entry.type : ''
+      const value = 'content' in entry ? formatUnknownValue(entry.content) : formatUnknownValue(entry)
+      if (!value) {
+        return []
+      }
+
+      if (entryType === 'diff') {
+        return [`[diff]\n${value}`]
+      }
+
+      if (entryType === 'terminal') {
+        return [`[terminal] ${value}`]
+      }
+
+      return [value]
+    })
+    .filter((line) => line.length > 0)
+}
+
+function collectToolCallMeta(meta: Record<string, unknown> | undefined): string[] {
+  if (!meta) {
+    return []
+  }
+
+  const rendered = formatUnknownValue(meta)
+  return rendered ? [rendered] : []
+}
+
+function formatUnknownValue(value: unknown): string {
+  const seen = new WeakSet<object>()
+
+  const visit = (input: unknown): string => {
+    if (input == null) return ''
+    if (typeof input === 'string') return input
+    if (typeof input === 'number' || typeof input === 'boolean' || typeof input === 'bigint') {
+      return String(input)
+    }
+
+    if (Array.isArray(input)) {
+      return input
+        .map((item) => visit(item))
+        .filter((item) => item.length > 0)
+        .join('\n')
+    }
+
+    if (!isRecord(input)) {
+      return ''
+    }
+
+    if (seen.has(input)) {
+      return '[circular]'
+    }
+    seen.add(input)
+
+    if (typeof input.text === 'string') {
+      return input.text
+    }
+
+    if ('content' in input) {
+      const nested = visit(input.content)
+      if (nested) {
+        return nested
+      }
+    }
+
+    if (typeof input.output === 'string') {
+      return input.output
+    }
+
+    if (Array.isArray(input.output)) {
+      const nestedOutput = visit(input.output)
+      if (nestedOutput) {
+        return nestedOutput
+      }
+    }
+
+    if (typeof input.type === 'string' && input.type === 'terminal') {
+      const terminalBits = [
+        typeof input.terminalId === 'string' ? `terminal=${input.terminalId}` : '',
+        typeof input.command === 'string' ? `command=${input.command}` : '',
+      ].filter(Boolean)
+      return terminalBits.join(' ')
+    }
+
+    const json = safeJson(input)
+    return json ?? ''
+  }
+
+  return visit(value).trim()
+}
+
+function safeJson(value: unknown): string | null {
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return null
   }
 }
 
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null
+}
